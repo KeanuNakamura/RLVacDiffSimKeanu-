@@ -15,9 +15,10 @@ from ase import Atoms
 from rgnn.graph.dataset.reaction import ReactionDataset
 from rgnn.graph.reaction import ReactionGraph
 from rgnn.graph.utils import batch_to
-from rgnn.train.loss import WeightedSumLoss
 from rgnn.train.trainer import AverageMeter
 from torch_geometric.loader import DataLoader
+
+from rlsim.drl.replay_buffer import PrioritizedReplayBuffer
 
 
 class Trainer:
@@ -44,42 +45,37 @@ class Trainer:
         self.q_params = q_params
         # self.kT = q_params["temperature"] * 8.617 * 10**-5
 
-    def update(self, memory_l, mode="dqn", **kwargs):
+    def update(self, replay_buffer: PrioritizedReplayBuffer, mode="dqn", **kwargs):
         if mode == "dqn":
-            loss = self.dqn_update(memory_l, **kwargs)
+            loss = self.dqn_update(replay_buffer, **kwargs)
         else:
-            loss = self.context_bandit_update(memory_l, **kwargs)
+            loss = self.context_bandit_update(replay_buffer, **kwargs)
         return loss
     
-    def context_bandit_update(self, memory_l, episode_size, num_epoch, batch_size=8, device="cuda"):
+    def context_bandit_update(
+        self, replay_buffer: PrioritizedReplayBuffer, num_epoch, batch_size=8, device="cuda"
+    ):
         self.policy_value_net.to(device)
         self.policy_value_net.train()
         losses = AverageMeter()
-        loss_fn = WeightedSumLoss(
-            keys=("q0", "q1"),
-            weights=(1.0, 1.0),
-            loss_fns=("mse_loss", "mse_loss"),
-        )
-        prob = [0.99 ** (len(memory_l) - i) for i in range(len(memory_l))]
-        episode_size = min(episode_size, len(memory_l))
-        randint = np.random.choice(range(len(memory_l)),size=episode_size, p=prob / np.sum(prob), replace=False) # no duplicating episodes
-        states, taken_actions, barrier, freq = [], [], [], []
-        for u in randint:
-            memory = memory_l[u]
-            states += memory.states
-            aspace = memory.act_space
-            actions = memory.actions
-            taken_actions += [[aspace[i][actions[i]]] for i in range(len(aspace))]
-            barrier += memory.barrier
-            freq += memory.freq
-        barrier = torch.tensor(barrier, dtype=torch.float)
-        freq = torch.tensor(freq, dtype=torch.float)
+        transitions, indices, weights = replay_buffer.sample()
+        if not transitions:
+            return 0.0
+
+        states = [t["state"] for t in transitions]
+        taken_actions = [t["taken_action"] for t in transitions]
+        barrier = torch.tensor([t["barrier"] for t in transitions], dtype=torch.float)
+        freq = torch.tensor([t["freq"] for t in transitions], dtype=torch.float)
+        weights = torch.tensor(weights, dtype=torch.float)
+
         dataset_list = []
         for i, state in enumerate(states):
             graph_list = convert(state, taken_actions[i])
             for data in graph_list:
                 data.q1 = freq[i].unsqueeze(0)
-                data.q0 = (-1*barrier[i]).unsqueeze(0)
+                data.q0 = (-1 * barrier[i]).unsqueeze(0)
+                data.buffer_idx = indices[i]
+                data.importance_weight = weights[i]
                 dataset_list.append(data)
         dataset = ReactionDataset(dataset_list)
         q_dataloader = DataLoader(dataset, batch_size=batch_size)
@@ -88,7 +84,13 @@ class Trainer:
             for batch in q_dataloader:
                 batch = batch_to(batch, device)
                 output = self.policy_value_net(batch, q_params=self.q_params)
-                loss = loss_fn(output, batch)
+                importance_weight = batch["importance_weight"].to(device)
+                q0_error = (batch.q0 - output["q0"]).abs()
+                q1_error = (batch.q1 - output["q1"]).abs()
+                td_errors = (q0_error + q1_error).detach()
+                loss = torch.mean(
+                    importance_weight * (q0_error ** 2 + q1_error ** 2)
+                )
                 self.optimizer.zero_grad()
                 loss.backward(retain_graph=True)
                 torch.nn.utils.clip_grad_norm_(
@@ -96,6 +98,10 @@ class Trainer:
                 )
                 self.optimizer.step()
                 losses.update(loss.item())
+                replay_buffer.update_priorities(
+                    batch["buffer_idx"].cpu().numpy(),
+                    td_errors.cpu().numpy(),
+                )
 
         return losses.avg
 
@@ -116,35 +122,28 @@ class Trainer:
         max_q = torch.max(next_q)
         return max_q
 
-    def dqn_update(self, memory_l, gamma, episode_size, num_epoch, batch_size=8, device="cuda"):
+    def dqn_update(
+        self, replay_buffer: PrioritizedReplayBuffer, gamma, num_epoch, batch_size=8, device="cuda"
+    ):
         self.target_net.load_state_dict(self.policy_value_net.state_dict())
         self.target_net.eval()
         self.target_net.to(device)
         self.policy_value_net.train()
         self.policy_value_net.to(device)
         losses = AverageMeter()
-        prob = [0.99 ** (len(memory_l) - i) for i in range(len(memory_l))]
-        randint = np.random.choice(range(len(memory_l)),size=episode_size, p=prob / np.sum(prob))
-        states, next_states, taken_actions, rewards, next_aspace = (
-            [],
-            [],
-            [],
-            [],
-            [],
-        )
-        for u in randint:
-            memory = memory_l[u]
-            states += memory.states[:-1]
-            next_states += memory.next_states[:-1]
-            rewards += memory.rewards[:-1]
-            aspace = memory.act_space
-            actions = memory.actions
-            taken_actions += [
-                [aspace[i][actions[i]]] for i in range(len(aspace) - 1)
-            ]
-            next_aspace += [aspace[i] for i in range(1, len(aspace))]
-        rewards = torch.tensor(rewards, dtype=torch.float)
-        next_Q = torch.zeros(len(next_aspace))
+
+        transitions, indices, weights = replay_buffer.sample()
+        if not transitions:
+            return 0.0
+
+        states = [t["state"] for t in transitions]
+        next_states = [t["next_state"] for t in transitions]
+        taken_actions = [t["taken_action"] for t in transitions]
+        next_aspace = [t["next_aspace"] for t in transitions]
+        rewards = torch.tensor([t["reward"] for t in transitions], dtype=torch.float)
+        weights = torch.tensor(weights, dtype=torch.float)
+
+        next_Q = torch.zeros(len(next_states))
         for i, state in enumerate(next_states):
             max_q = self.get_max_Q(
                 self.target_net, state, next_aspace[i], device=device
@@ -155,6 +154,8 @@ class Trainer:
             graph_list = convert(state, taken_actions[i])
             for data in graph_list:
                 data.rl_q = next_Q[i] * gamma + rewards[i]
+                data.buffer_idx = indices[i]
+                data.importance_weight = weights[i]
                 dataset_list.append(data)
         dataset = ReactionDataset(dataset_list)
         q_dataloader = DataLoader(
@@ -166,7 +167,9 @@ class Trainer:
                 q_pred = self.policy_value_net(batch, q_params=self.q_params)[
                     "rl_q"
                 ]
-                loss = torch.mean((batch["rl_q"] - q_pred) ** 2)
+                importance_weight = batch["importance_weight"].to(device)
+                td_errors = (batch["rl_q"] - q_pred).abs().detach()
+                loss = torch.mean(importance_weight * td_errors ** 2)
                 self.optimizer.zero_grad()
                 loss.backward(retain_graph=True)
                 torch.nn.utils.clip_grad_norm_(
@@ -174,6 +177,10 @@ class Trainer:
                 )
                 self.optimizer.step()
                 losses.update(loss.detach().item())
+                replay_buffer.update_priorities(
+                    batch["buffer_idx"].cpu().numpy(),
+                    td_errors.cpu().numpy(),
+                )
                 del batch, q_pred, loss
         if device == "cuda":
             torch.cuda.empty_cache()

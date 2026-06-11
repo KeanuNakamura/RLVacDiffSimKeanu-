@@ -6,6 +6,7 @@ import numpy as np
 import toml
 from rgnn.common.registry import registry
 
+from rlsim.drl.replay_buffer import PrioritizedReplayBuffer
 from rlsim.drl.simulator import RLSimulator
 from rlsim.drl.trainer import Trainer
 from rlsim.environment import Environment
@@ -71,6 +72,15 @@ def train_DQN(task, logger, config):
         train_all=train_config["train_all"],
     )
 
+    update_params = train_config["update_params"]
+    replay_buffer = PrioritizedReplayBuffer(
+        sample_size=update_params.pop("sample_size", 64),
+        alpha=update_params.pop("replay_alpha", 0.6),
+        beta=update_params.pop("replay_beta", 0.4),
+        beta_increment=update_params.pop("replay_beta_increment", 0.001),
+        epsilon=update_params.pop("replay_epsilon", 1e-6),
+    )
+
     replay_list = []
     for epoch in range(n_episodes):
         atoms = pool[np.random.randint(len(pool))]
@@ -89,8 +99,11 @@ def train_DQN(task, logger, config):
             info = simulator.train_step(temperature)
             replay_list[-1].add(info)
             logger.info(f"  tstep : {tstep}")
-        train_config["update_params"].update({"episode_size": int(1 + epoch ** (2 / 3))})
-        loss = trainer.update(memory_l=replay_list, mode=train_mode, **train_config["update_params"])
+        if train_mode == "dqn":
+            replay_buffer.add_dqn_episode(replay_list[-1])
+        else:
+            replay_buffer.add_context_bandit_episode(replay_list[-1])
+        loss = trainer.update(replay_buffer=replay_buffer, mode=train_mode, **update_params)
         with open(task + "/loss.txt", "a") as file:
             file.write(str(epoch) + "\t" + str(loss) + "\n")
             logger.info(f"   Loss : {loss:.3f}")

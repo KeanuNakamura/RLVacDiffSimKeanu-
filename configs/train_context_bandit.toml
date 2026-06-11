@@ -28,6 +28,11 @@ train_all = true
 batch_size = 8
 device = "cuda"
 num_epoch = 5
+sample_size = 64
+replay_alpha = 0.6
+replay_beta = 0.4
+replay_beta_increment = 0.001
+replay_epsilon = 1e-6
 
 [train.calc_info]
 cutoff = 4.0

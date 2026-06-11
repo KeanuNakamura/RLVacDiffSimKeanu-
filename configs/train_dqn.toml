@@ -1,4 +1,4 @@
-task = "train_test_dqn"
+task = "models/training_models/basic_dqn"
 [logger]
 filename = "train"
 name = "TRAIN"
@@ -13,22 +13,27 @@ beta = 0.5
 dqn = true
 [model.reaction_model]
 "@name" = "painn" 
-model_path = "/path/to/reaction_model" # Change this to the model path e.g., "/home/hojechun/ssd_mnt/1-RLVacDiff/1-Models/best_model_mace_Vrandom_sum_0716.pth.tar"
+model_path = "/home/keanun65/projects/RLVacDiffSim/models/reaction_model.pth.tar" # Change this to the model path e.g., "/home/hojechun/ssd_mnt/1-RLVacDiff/1-Models/best_model_mace_Vrandom_sum_0716.pth.tar"
 
 [train]
 device = "cuda"
 horizon = 50
 lr = 1e-5
 mode = "dqn"
-n_episodes = 100
-n_poscars = [100]
-poscar_dir = ["/path/to/poscars"] # Change this to the directory where your POSCAR files are stored.
+n_episodes = 30
+n_poscars = [35]
+poscar_dir = ["/home/keanun65/projects/RLVacDiffSim/data/poscar_files"] # Change this to the directory where your POSCAR files are stored.
 temperature = [300, 500, 700, 900]
 train_all = true
 [train.update_params]
 batch_size = 8
 gamma = 0.9
 num_epoch = 5
+sample_size = 64
+replay_alpha = 0.6
+replay_beta = 0.4
+replay_beta_increment = 0.001
+replay_epsilon = 1e-6
 
 [train.calc_info]
 cutoff = 4.0
