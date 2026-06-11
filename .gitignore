@@ -166,3 +166,4 @@ cython_debug/
 # data
 dev/*
 !dev/.gitkeep
+poscar_files
