@@ -167,3 +167,5 @@ cython_debug/
 dev/*
 !dev/.gitkeep
 poscar_files
+logs
+demo
